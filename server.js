@@ -8,6 +8,12 @@ const cors = require('cors');
 const app = express();
 app.use(express.json());
 
+function buildBaseUrl(req) {
+  // App Runner terminates TLS and forwards headers
+  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
+  const host  = req.get('x-forwarded-host') || req.get('host');
+  return `${proto}://${host}`;
+}
 // ---------- Config from environment ----------
 const PORT = process.env.PORT || 5000;
 const FB_APP_ID = process.env.FB_APP_ID;                 // required
@@ -27,7 +33,6 @@ function requireEnv(name, val) {
 }
 requireEnv('FB_APP_ID', FB_APP_ID);
 requireEnv('FB_APP_SECRET', FB_APP_SECRET);
-requireEnv('BASE_URL', BASE_URL);
 
 const REDIRECT_URI = `${BASE_URL.replace(/\/$/, '')}/auth/instagram/callback`;
 
@@ -61,6 +66,7 @@ app.get('/healthz', (req, res) => res.send('ok'));
 
 // ---------- OAuth ----------
 app.get('/auth/instagram', (req, res) => {
+  const REDIRECT_URI = `${buildBaseUrl(req)}/auth/instagram/callback`;
   const url =
     'https://www.facebook.com/v17.0/dialog/oauth?' +
     `client_id=${encodeURIComponent(FB_APP_ID)}` +
