@@ -1,4 +1,4 @@
-// server.js (env-driven, deploy-ready)
+// server.js — env-driven, App Runner friendly (no BASE_URL needed)
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -8,23 +8,15 @@ const cors = require('cors');
 const app = express();
 app.use(express.json());
 
-function buildBaseUrl(req) {
-  // App Runner terminates TLS and forwards headers
-  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
-  const host  = req.get('x-forwarded-host') || req.get('host');
-  return `${proto}://${host}`;
-}
-// ---------- Config from environment ----------
+// ------------ Config ------------
 const PORT = process.env.PORT || 5000;
 const FB_APP_ID = process.env.FB_APP_ID;                 // required
 const FB_APP_SECRET = process.env.FB_APP_SECRET;         // required
-const BASE_URL = process.env.BASE_URL;                   // required: e.g. https://<your-apprunner>.awsapprunner.com
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
-const DATA_DIR = process.env.DATA_DIR || __dirname;      // on AWS App Runner use /tmp
+const DATA_DIR = process.env.DATA_DIR || '/tmp';         // writable on App Runner
 
 app.use(cors({ origin: CORS_ORIGIN, methods: ['GET', 'POST'] }));
 
-// Derived
 function requireEnv(name, val) {
   if (!val) {
     console.error(`[CONFIG] Missing ${name}. Set it as an environment variable.`);
@@ -34,9 +26,14 @@ function requireEnv(name, val) {
 requireEnv('FB_APP_ID', FB_APP_ID);
 requireEnv('FB_APP_SECRET', FB_APP_SECRET);
 
-const REDIRECT_URI = `${BASE_URL.replace(/\/$/, '')}/auth/instagram/callback`;
+// Build our own public base URL from the request (works behind App Runner proxies)
+function buildBaseUrl(req) {
+  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
+  const host  = req.get('x-forwarded-host') || req.get('host');
+  return `${proto}://${host}`;
+}
 
-// ---------- Storage (JSON files) ----------
+// ------------ Storage helpers ------------
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
 const SCHEDULE_FILE = path.join(DATA_DIR, 'scheduleData.json');
 
@@ -60,25 +57,32 @@ function saveJSON(file, data) {
   }
 }
 
-// ---------- Health checks ----------
+// Ensure files exist (best-effort)
+try { if (!fs.existsSync(ACCOUNTS_FILE)) saveJSON(ACCOUNTS_FILE, {}); } catch {}
+try { if (!fs.existsSync(SCHEDULE_FILE)) saveJSON(SCHEDULE_FILE, { times: [] }); } catch {}
+
+// ------------ Health ------------
 app.get('/', (req, res) => res.send('root ok'));
 app.get('/healthz', (req, res) => res.send('ok'));
 
-// ---------- OAuth ----------
+// ------------ OAuth start ------------
 app.get('/auth/instagram', (req, res) => {
   const REDIRECT_URI = `${buildBaseUrl(req)}/auth/instagram/callback`;
   const url =
-    'https://www.facebook.com/v17.0/dialog/oauth?' +
-    `client_id=${encodeURIComponent(FB_APP_ID)}` +
+    'https://www.facebook.com/v17.0/dialog/oauth' +
+    `?client_id=${encodeURIComponent(FB_APP_ID)}` +
     `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
     '&scope=instagram_basic,instagram_content_publish' +
     '&response_type=code';
   return res.redirect(url);
 });
 
+// ------------ OAuth callback ------------
 app.get('/auth/instagram/callback', async (req, res) => {
   const code = req.query.code;
   if (!code) return res.status(400).send('No code returned');
+
+  const REDIRECT_URI = `${buildBaseUrl(req)}/auth/instagram/callback`;
 
   try {
     console.log('[OAuth] code:', String(code).slice(0, 8) + '...');
@@ -107,24 +111,30 @@ app.get('/auth/instagram/callback', async (req, res) => {
     const longToken = longRes.data.access_token;
     console.log('[OAuth] long token ok');
 
-    // 3) Get FB Pages
-    const pages = await axios.get('https://graph.facebook.com/v17.0/me/accounts', {
+    // 3) Fetch Pages
+    const pagesRes = await axios.get('https://graph.facebook.com/v17.0/me/accounts', {
       params: { access_token: longToken }
     });
-    const pageList = pages.data?.data || [];
-    if (!pageList.length) throw new Error('No Facebook Pages found for this user');
-    const pageId = pageList[0].id;
-    console.log('[OAuth] page ok:', pageId);
+    const pages = pagesRes.data?.data || [];
+    if (!pages.length) throw new Error('No Facebook Pages found for this user');
+    console.log('[OAuth] pages found:', pages.length);
 
-    // 4) From Page → Instagram Business account
-    const ig = await axios.get(`https://graph.facebook.com/v17.0/${pageId}`, {
-      params: { fields: 'instagram_business_account', access_token: longToken }
-    });
-    const igAccountId = ig.data?.instagram_business_account?.id;
-    if (!igAccountId) throw new Error('No Instagram Business account linked to this Page');
+    // 4) Find a page with IG Business linked
+    let igAccountId = null;
+    for (const p of pages) {
+      try {
+        const igRes = await axios.get(`https://graph.facebook.com/v17.0/${p.id}`, {
+          params: { fields: 'instagram_business_account', access_token: longToken }
+        });
+        const id = igRes.data?.instagram_business_account?.id;
+        if (id) { igAccountId = id; break; }
+      } catch (e) {}
+    }
+    if (!igAccountId) throw new Error('No Instagram Business account linked to any of the Pages');
+
     console.log('[OAuth] IG ok:', igAccountId);
 
-    // 5) Save account
+    // 5) Save
     const accounts = loadJSON(ACCOUNTS_FILE);
     accounts[igAccountId] = {
       accessToken: longToken,
@@ -134,7 +144,7 @@ app.get('/auth/instagram/callback', async (req, res) => {
     saveJSON(ACCOUNTS_FILE, accounts);
     console.log('[OAuth] saved account:', igAccountId);
 
-    // 6) Friendly confirmation page
+    // 6) Confirmation page
     res.send(`
       <html>
         <body style="font-family:sans-serif; text-align:center; margin-top:48px">
@@ -146,11 +156,13 @@ app.get('/auth/instagram/callback', async (req, res) => {
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error('[OAuth] error:', detail);
-    res.status(500).send(`OAuth error: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
+    res
+      .status(500)
+      .send(`<pre>OAuth error:\n${typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2)}</pre>`);
   }
 });
 
-// ---------- Minimal APIs your frontend uses ----------
+// ------------ Minimal APIs ------------
 app.get('/accounts', (req, res) => {
   const accounts = loadJSON(ACCOUNTS_FILE);
   const list = Object.entries(accounts).map(([accountId, acc]) => ({
@@ -178,11 +190,10 @@ app.post('/schedule', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// ---------- Start ----------
+// ------------ Start ------------
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
   console.log(`[CONFIG] FB_APP_ID=${FB_APP_ID}`);
-  console.log(`[CONFIG] BASE_URL=${BASE_URL}`);
   console.log(`[CONFIG] DATA_DIR=${DATA_DIR}`);
   console.log(`[CONFIG] CORS_ORIGIN=${CORS_ORIGIN}`);
 });
