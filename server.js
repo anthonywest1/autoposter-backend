@@ -68,12 +68,21 @@ app.get('/healthz', (req, res) => res.send('ok'));
 // ------------ OAuth start ------------
 app.get('/auth/instagram', (req, res) => {
   const REDIRECT_URI = `${buildBaseUrl(req)}/auth/instagram/callback`;
+
+  // Request Page access as well (needed for /me/accounts)
+  const scopes = [
+    'instagram_basic',
+    'instagram_content_publish',
+    'pages_show_list'
+  ].join(',');
+
   const url =
     'https://www.facebook.com/v17.0/dialog/oauth' +
     `?client_id=${encodeURIComponent(FB_APP_ID)}` +
     `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
-    '&scope=instagram_basic,instagram_content_publish' +
+    `&scope=${encodeURIComponent(scopes)}` +
     '&response_type=code';
+
   return res.redirect(url);
 });
 
