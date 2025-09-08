@@ -1,4 +1,4 @@
-// server.js — live-mode, robust save + debug endpoints
+// server.js — robust IG lookup using Page access tokens (App Runner friendly)
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 5000;
 const FB_APP_ID = process.env.FB_APP_ID;                 // required
 const FB_APP_SECRET = process.env.FB_APP_SECRET;         // required
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
-const DATA_DIR = process.env.DATA_DIR || '/tmp';         // App Runner writable path
+const DATA_DIR = process.env.DATA_DIR || '/tmp';         // writable on App Runner
 
 app.use(cors({ origin: CORS_ORIGIN, methods: ['GET', 'POST'] }));
 
@@ -50,8 +50,9 @@ function loadJSON(file) {
 function saveJSON(file, data) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-    console.log(`Wrote ${file} (bytes: ${Buffer.byteLength(JSON.stringify(data))})`);
+    const json = JSON.stringify(data, null, 2);
+    fs.writeFileSync(file, json);
+    console.log(`Wrote ${file} (bytes: ${Buffer.byteLength(json)})`);
   } catch (e) {
     console.error(`saveJSON error for ${file}:`, e);
   }
@@ -68,10 +69,12 @@ app.get('/healthz', (req, res) => res.send('ok'));
 // ------------ OAuth start ------------
 app.get('/auth/instagram', (req, res) => {
   const REDIRECT_URI = `${buildBaseUrl(req)}/auth/instagram/callback`;
+  // Include pages_show_list; pages_read_engagement helps page field reads for some setups
   const scopes = [
     'instagram_basic',
     'instagram_content_publish',
-    'pages_show_list'
+    'pages_show_list',
+    'pages_read_engagement'
   ].join(',');
 
   const url =
@@ -80,7 +83,6 @@ app.get('/auth/instagram', (req, res) => {
     `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
     `&scope=${encodeURIComponent(scopes)}` +
     '&response_type=code';
-
   return res.redirect(url);
 });
 
@@ -88,7 +90,6 @@ app.get('/auth/instagram', (req, res) => {
 app.get('/auth/instagram/callback', async (req, res) => {
   const code = req.query.code;
   if (!code) return res.status(400).send('No code returned');
-
   const REDIRECT_URI = `${buildBaseUrl(req)}/auth/instagram/callback`;
 
   try {
@@ -106,7 +107,7 @@ app.get('/auth/instagram/callback', async (req, res) => {
     const shortToken = shortRes.data.access_token;
     console.log('[OAuth] short token ok');
 
-    // 2) Long-lived token
+    // 2) Long-lived user token
     const longRes = await axios.get('https://graph.facebook.com/v17.0/oauth/access_token', {
       params: {
         grant_type: 'fb_exchange_token',
@@ -115,84 +116,79 @@ app.get('/auth/instagram/callback', async (req, res) => {
         fb_exchange_token: shortToken
       }
     });
-    const longToken = longRes.data.access_token;
+    const userToken = longRes.data.access_token;
     console.log('[OAuth] long token ok');
 
-    // 3) Find IG business account via multiple paths (robust)
-    let igAccountId = null;
-
-    // Path 1: /me/accounts (requires pages_show_list + user selected Page)
+    // 3) Get Pages with Page access tokens (IMPORTANT: use page token to query page fields)
+    // We ask for id,name,access_token so we can call the page node using its own token.
+    let pages = [];
     try {
       const pagesRes = await axios.get('https://graph.facebook.com/v17.0/me/accounts', {
-        params: { access_token: longToken }
+        params: { access_token: userToken, fields: 'id,name,access_token' }
       });
-      const pages = pagesRes.data?.data || [];
-      console.log('[OAuth] /me/accounts pages:', pages.length);
-      for (const p of pages) {
-        try {
-          const igRes = await axios.get(`https://graph.facebook.com/v17.0/${p.id}`, {
-            params: { fields: 'instagram_business_account', access_token: longToken }
-          });
-          const id = igRes.data?.instagram_business_account?.id;
-          if (id) { igAccountId = id; break; }
-        } catch {}
-      }
+      pages = pagesRes.data?.data || [];
+      console.log('[OAuth] /me/accounts pages:', pages.length, pages.map(p => `${p.name}(${p.id})`).join(', '));
     } catch (e) {
       console.log('[OAuth] /me/accounts failed:', e.response?.data || e.message);
     }
 
-    // Path 2: /me?fields=instagram_business_accounts
-    if (!igAccountId) {
-      try {
-        const meRes = await axios.get('https://graph.facebook.com/v17.0/me', {
-          params: { fields: 'instagram_business_accounts{id,username}', access_token: longToken }
-        });
-        const igList = meRes.data?.instagram_business_accounts?.data || [];
-        console.log('[OAuth] /me instagram_business_accounts:', igList.length);
-        if (igList.length) igAccountId = igList[0].id;
-      } catch (e) {
-        console.log('[OAuth] /me?fields=instagram_business_accounts failed:', e.response?.data || e.message);
-      }
+    if (!pages.length) {
+      throw new Error('No Facebook Pages found for this user (ensure you selected the Page on the consent screen).');
     }
 
-    // Path 3: /me?fields=accounts{instagram_business_account}
-    if (!igAccountId) {
+    // 4) Scan pages for linked IG account, using each page's access_token
+    let igAccountId = null;
+    let foundOnPage = null;
+    for (const p of pages) {
+      if (!p.access_token) continue; // sometimes missing; skip
       try {
-        const meAccRes = await axios.get('https://graph.facebook.com/v17.0/me', {
-          params: { fields: 'accounts{id,name,instagram_business_account}', access_token: longToken }
+        const igRes = await axios.get(`https://graph.facebook.com/v17.0/${p.id}`, {
+          params: { fields: 'instagram_business_account', access_token: p.access_token }
         });
-        const accs = meAccRes.data?.accounts?.data || [];
-        console.log('[OAuth] /me accounts w/IG field:', accs.length);
-        for (const a of accs) {
-          const id = a?.instagram_business_account?.id;
-          if (id) { igAccountId = id; break; }
+        const id = igRes.data?.instagram_business_account?.id;
+        if (id) {
+          igAccountId = id;
+          foundOnPage = p;
+          break;
         }
       } catch (e) {
-        console.log('[OAuth] /me?fields=accounts{instagram_business_account} failed:', e.response?.data || e.message);
+        // keep trying other pages
       }
     }
 
     if (!igAccountId) {
-      throw new Error('No Instagram Business account found. On the consent screen, click "Choose what you allow" and select your Page and Instagram account; also ensure IG is linked to the Page.');
+      throw new Error('No Instagram Business account linked to any of the selected Pages. Make sure your IG is BUSINESS and linked to the Page you checked during consent (Page Settings → Linked Accounts).');
     }
 
-    console.log('[OAuth] IG ok:', igAccountId);
+    console.log('[OAuth] IG ok:', igAccountId, 'on Page:', `${foundOnPage?.name}(${foundOnPage?.id})`);
 
-    // 4) Save
+    // 5) (Optional) Fetch IG username to store a friendly label
+    let igUsername = `Instagram-${igAccountId}`;
+    try {
+      const igInfo = await axios.get(`https://graph.facebook.com/v17.0/${igAccountId}`, {
+        params: { fields: 'username', access_token: foundOnPage.access_token }
+      });
+      if (igInfo.data?.username) igUsername = igInfo.data.username;
+    } catch {}
+
+    // 6) Save to accounts.json
     const accounts = loadJSON(ACCOUNTS_FILE);
     accounts[igAccountId] = {
-      accessToken: longToken, // (stored for MVP; rotate to DB later)
-      username: `Instagram-${igAccountId}`,
+      accessToken: userToken,   // long-lived user token; sufficient for publishing with page token exchange later
+      pageId: foundOnPage.id,
+      pageName: foundOnPage.name,
+      igUsername,
       buckets: []
     };
     saveJSON(ACCOUNTS_FILE, accounts);
     console.log('[OAuth] saved account:', igAccountId, '->', ACCOUNTS_FILE);
 
-    // 5) Confirmation page
+    // 7) Confirmation page
     res.send(`
       <html>
         <body style="font-family:sans-serif; text-align:center; margin-top:48px">
           <h2>Account connected!</h2>
+          <p>Linked IG: <b>${igUsername}</b> via Page <b>${foundOnPage.name}</b>.</p>
           <p>You can close this tab and return to the app.</p>
         </body>
       </html>
@@ -211,7 +207,9 @@ app.get('/accounts', (req, res) => {
   const accounts = loadJSON(ACCOUNTS_FILE);
   const list = Object.entries(accounts).map(([accountId, acc]) => ({
     accountId,
-    username: acc.username
+    username: acc.igUsername || acc.username || `Instagram-${accountId}`,
+    pageId: acc.pageId,
+    pageName: acc.pageName
   }));
   res.json(list);
 });
@@ -233,7 +231,7 @@ app.post('/schedule', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// ------------ Debug (safe) ------------
+// ------------ Debug ------------
 app.get('/debug/files', (req, res) => {
   try {
     const aExists = fs.existsSync(ACCOUNTS_FILE);
@@ -254,9 +252,9 @@ app.get('/debug/files', (req, res) => {
 app.get('/debug/read-accounts', (req, res) => {
   try {
     const acc = loadJSON(ACCOUNTS_FILE);
-    // mask tokens
+    // mask tokens if present
     for (const k of Object.keys(acc)) {
-      if (acc[k].accessToken) acc[k].accessToken = `***len:${acc[k].accessToken.length}`;
+      if (acc[k].accessToken) acc[k].accessToken = `***len:${String(acc[k].accessToken).length}`;
     }
     res.json(acc);
   } catch (e) {
