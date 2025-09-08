@@ -1,4 +1,4 @@
-// server.js — env-driven, App Runner friendly (no BASE_URL needed)
+// server.js — live-mode, robust save + debug endpoints
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 5000;
 const FB_APP_ID = process.env.FB_APP_ID;                 // required
 const FB_APP_SECRET = process.env.FB_APP_SECRET;         // required
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
-const DATA_DIR = process.env.DATA_DIR || '/tmp';         // writable on App Runner
+const DATA_DIR = process.env.DATA_DIR || '/tmp';         // App Runner writable path
 
 app.use(cors({ origin: CORS_ORIGIN, methods: ['GET', 'POST'] }));
 
@@ -26,7 +26,7 @@ function requireEnv(name, val) {
 requireEnv('FB_APP_ID', FB_APP_ID);
 requireEnv('FB_APP_SECRET', FB_APP_SECRET);
 
-// Build our own public base URL from the request (works behind App Runner proxies)
+// Build public base URL from request (behind App Runner proxies)
 function buildBaseUrl(req) {
   const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
   const host  = req.get('x-forwarded-host') || req.get('host');
@@ -51,7 +51,7 @@ function saveJSON(file, data) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
-    console.log(`Wrote ${file}`);
+    console.log(`Wrote ${file} (bytes: ${Buffer.byteLength(JSON.stringify(data))})`);
   } catch (e) {
     console.error(`saveJSON error for ${file}:`, e);
   }
@@ -68,8 +68,6 @@ app.get('/healthz', (req, res) => res.send('ok'));
 // ------------ OAuth start ------------
 app.get('/auth/instagram', (req, res) => {
   const REDIRECT_URI = `${buildBaseUrl(req)}/auth/instagram/callback`;
-
-  // Request Page access as well (needed for /me/accounts)
   const scopes = [
     'instagram_basic',
     'instagram_content_publish',
@@ -120,40 +118,77 @@ app.get('/auth/instagram/callback', async (req, res) => {
     const longToken = longRes.data.access_token;
     console.log('[OAuth] long token ok');
 
-    // 3) Fetch Pages
-    const pagesRes = await axios.get('https://graph.facebook.com/v17.0/me/accounts', {
-      params: { access_token: longToken }
-    });
-    const pages = pagesRes.data?.data || [];
-    if (!pages.length) throw new Error('No Facebook Pages found for this user');
-    console.log('[OAuth] pages found:', pages.length);
-
-    // 4) Find a page with IG Business linked
+    // 3) Find IG business account via multiple paths (robust)
     let igAccountId = null;
-    for (const p of pages) {
-      try {
-        const igRes = await axios.get(`https://graph.facebook.com/v17.0/${p.id}`, {
-          params: { fields: 'instagram_business_account', access_token: longToken }
-        });
-        const id = igRes.data?.instagram_business_account?.id;
-        if (id) { igAccountId = id; break; }
-      } catch (e) {}
+
+    // Path 1: /me/accounts (requires pages_show_list + user selected Page)
+    try {
+      const pagesRes = await axios.get('https://graph.facebook.com/v17.0/me/accounts', {
+        params: { access_token: longToken }
+      });
+      const pages = pagesRes.data?.data || [];
+      console.log('[OAuth] /me/accounts pages:', pages.length);
+      for (const p of pages) {
+        try {
+          const igRes = await axios.get(`https://graph.facebook.com/v17.0/${p.id}`, {
+            params: { fields: 'instagram_business_account', access_token: longToken }
+          });
+          const id = igRes.data?.instagram_business_account?.id;
+          if (id) { igAccountId = id; break; }
+        } catch {}
+      }
+    } catch (e) {
+      console.log('[OAuth] /me/accounts failed:', e.response?.data || e.message);
     }
-    if (!igAccountId) throw new Error('No Instagram Business account linked to any of the Pages');
+
+    // Path 2: /me?fields=instagram_business_accounts
+    if (!igAccountId) {
+      try {
+        const meRes = await axios.get('https://graph.facebook.com/v17.0/me', {
+          params: { fields: 'instagram_business_accounts{id,username}', access_token: longToken }
+        });
+        const igList = meRes.data?.instagram_business_accounts?.data || [];
+        console.log('[OAuth] /me instagram_business_accounts:', igList.length);
+        if (igList.length) igAccountId = igList[0].id;
+      } catch (e) {
+        console.log('[OAuth] /me?fields=instagram_business_accounts failed:', e.response?.data || e.message);
+      }
+    }
+
+    // Path 3: /me?fields=accounts{instagram_business_account}
+    if (!igAccountId) {
+      try {
+        const meAccRes = await axios.get('https://graph.facebook.com/v17.0/me', {
+          params: { fields: 'accounts{id,name,instagram_business_account}', access_token: longToken }
+        });
+        const accs = meAccRes.data?.accounts?.data || [];
+        console.log('[OAuth] /me accounts w/IG field:', accs.length);
+        for (const a of accs) {
+          const id = a?.instagram_business_account?.id;
+          if (id) { igAccountId = id; break; }
+        }
+      } catch (e) {
+        console.log('[OAuth] /me?fields=accounts{instagram_business_account} failed:', e.response?.data || e.message);
+      }
+    }
+
+    if (!igAccountId) {
+      throw new Error('No Instagram Business account found. On the consent screen, click "Choose what you allow" and select your Page and Instagram account; also ensure IG is linked to the Page.');
+    }
 
     console.log('[OAuth] IG ok:', igAccountId);
 
-    // 5) Save
+    // 4) Save
     const accounts = loadJSON(ACCOUNTS_FILE);
     accounts[igAccountId] = {
-      accessToken: longToken,
+      accessToken: longToken, // (stored for MVP; rotate to DB later)
       username: `Instagram-${igAccountId}`,
       buckets: []
     };
     saveJSON(ACCOUNTS_FILE, accounts);
-    console.log('[OAuth] saved account:', igAccountId);
+    console.log('[OAuth] saved account:', igAccountId, '->', ACCOUNTS_FILE);
 
-    // 6) Confirmation page
+    // 5) Confirmation page
     res.send(`
       <html>
         <body style="font-family:sans-serif; text-align:center; margin-top:48px">
@@ -182,7 +217,6 @@ app.get('/accounts', (req, res) => {
 });
 
 app.get('/buckets', (req, res) => res.json(loadJSON(ACCOUNTS_FILE)));
-
 app.post('/buckets', (req, res) => {
   const { accountId, buckets } = req.body || {};
   const accounts = loadJSON(ACCOUNTS_FILE);
@@ -197,6 +231,37 @@ app.post('/schedule', (req, res) => {
   const times = (req.body && req.body.schedule) || [];
   saveJSON(SCHEDULE_FILE, { times });
   res.json({ status: 'ok' });
+});
+
+// ------------ Debug (safe) ------------
+app.get('/debug/files', (req, res) => {
+  try {
+    const aExists = fs.existsSync(ACCOUNTS_FILE);
+    const sExists = fs.existsSync(SCHEDULE_FILE);
+    res.json({
+      accountsPath: ACCOUNTS_FILE,
+      accountsExists: aExists,
+      accountsBytes: aExists ? fs.statSync(ACCOUNTS_FILE).size : 0,
+      schedulePath: SCHEDULE_FILE,
+      scheduleExists: sExists,
+      scheduleBytes: sExists ? fs.statSync(SCHEDULE_FILE).size : 0
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get('/debug/read-accounts', (req, res) => {
+  try {
+    const acc = loadJSON(ACCOUNTS_FILE);
+    // mask tokens
+    for (const k of Object.keys(acc)) {
+      if (acc[k].accessToken) acc[k].accessToken = `***len:${acc[k].accessToken.length}`;
+    }
+    res.json(acc);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
 });
 
 // ------------ Start ------------
